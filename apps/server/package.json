@@ -1,0 +1,30 @@
+{
+  "name": "@voice-agent/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "echo 'no-op'"
+  },
+  "dependencies": {
+    "@livekit/protocol": "^1.41.0",
+    "@voice-agent/config": "0.1.0",
+    "@voice-agent/shared": "0.1.0",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "ioredis": "^5.6.1",
+    "livekit-server-sdk": "^2.14.0",
+    "pg": "^8.15.6",
+    "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.18",
+    "@types/express": "^4.17.21",
+    "@types/pg": "^8.11.10",
+    "typescript": "^5.8.3"
+  }
+}

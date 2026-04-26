@@ -1,0 +1,15 @@
+node_modules
+npm-debug.log*
+pnpm-lock.yaml
+package-lock.json
+.yarn
+# Never commit secrets from any workspace package/app.
+**/.env
+**/.env.local
+**/.env.*.local
+**/.env*
+!**/.env.example
+dist
+coverage
+.DS_Store
+*.tsbuildinfo
