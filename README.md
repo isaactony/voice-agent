@@ -1,236 +1,178 @@
 # How to build a production-ready voice agent platform with LiveKit, OpenAI Realtime, Cartesia, and Node.js
 
-This repository is a production-oriented TypeScript monorepo that implements a real-time voice agent platform with:
+This repository is a production-oriented TypeScript monorepo for a real-time voice agent platform.
 
-- LiveKit for WebRTC media transport and room orchestration
-- LiveKit Agents JS SDK for backend worker runtime
-- OpenAI Realtime for low-latency speech understanding + response generation
-- Cartesia Sonic-3 as a separate final TTS layer
-- Express API for session creation and LiveKit access token minting
-- PostgreSQL for persistent session/transcript/tool/outcome storage
-- Redis for ephemeral session/workflow state
+It uses:
+- LiveKit for WebRTC transport, room orchestration, and agent dispatch
+- LiveKit React + Agents UI for the web voice frontend
+- LiveKit Agents JS SDK for backend agent runtime
+- OpenAI Realtime for low-latency understanding and response generation
+- Cartesia Sonic-3 as the final speech synthesis layer
+- Express API for session bootstrap and token minting
+- PostgreSQL for persistent conversation and tool telemetry
+- Redis for ephemeral session/runtime context
 
-The key architecture choice is **half-cascade**:
+## Core Architecture
 
-- We do **not** run a full STT -> LLM -> TTS chain manually.
-- We do **not** allow OpenAI Realtime to produce final audio.
-- We run OpenAI Realtime in **text-only modality** and keep final speech synthesis in Cartesia.
+This project uses a **half-cascade architecture**.
 
----
+What that means:
+- We do **not** run a manual full `STT -> LLM -> TTS` pipeline in app code.
+- We do **not** let OpenAI Realtime output final audio.
+- OpenAI Realtime is configured in **text-only mode** (`modalities: ['text']`).
+- Cartesia Sonic-3 is the dedicated final TTS layer.
 
-## Table of contents
+This gives us low-latency conversational intelligence plus independent voice control.
 
-1. [Architecture at a glance](#architecture-at-a-glance)
-2. [Monorepo structure](#monorepo-structure)
-3. [End-to-end request flow](#end-to-end-request-flow)
-4. [What each app does](#what-each-app-does)
-5. [SDK usage map](#sdk-usage-map)
-6. [Data model and persistence](#data-model-and-persistence)
-7. [Local setup](#local-setup)
-8. [Run and verify](#run-and-verify)
-9. [Troubleshooting](#troubleshooting)
-10. [Deployment notes](#deployment-notes)
-11. [Security and production hardening](#security-and-production-hardening)
-12. [Article outline you can reuse](#article-outline-you-can-reuse)
-
----
-
-## Architecture at a glance
+## Architecture Diagram
 
 ```mermaid
 flowchart LR
-    Browser[Next.js Frontend\nLiveKit React + Agents UI] -->|POST /session/start| API[Express API]
-    API -->|mint JWT + dispatch config| LiveKit[(LiveKit Cloud)]
-    Browser -->|WebRTC join room| LiveKit
-    LiveKit -->|dispatch job| Worker[LiveKit Agents JS Worker]
-    Worker -->|Realtime text generation| OpenAI[OpenAI Realtime\nmodalities: text]
-    Worker -->|final TTS| Cartesia[Cartesia Sonic-3]
-    Worker -->|publish agent audio| LiveKit
-    LiveKit -->|audio track playback| Browser
-    API --> Postgres[(PostgreSQL)]
-    Worker --> Postgres
-    API --> Redis[(Redis)]
-    Worker --> Redis
+    Browser[Frontend\nNext.js + LiveKit React + Agents UI] -->|POST /session/start| API[Express API]
+    API -->|JWT + room config + agent dispatch| LK[(LiveKit Cloud)]
+    Browser -->|WebRTC join| LK
+    LK -->|dispatch job| Worker[LiveKit Agents Worker\nNode.js + TS]
+    Worker -->|text-in/text-out realtime reasoning| OAI[OpenAI Realtime\nmodalities: text]
+    Worker -->|final speech synthesis| CART[Cartesia Sonic-3]
+    Worker -->|publish audio track| LK
+    LK -->|agent audio stream| Browser
+    API --> PG[(PostgreSQL)]
+    Worker --> PG
+    API --> REDIS[(Redis)]
+    Worker --> REDIS
 ```
 
-Why this works well:
+## Monorepo Structure
 
-- LiveKit handles jitter, track routing, reconnection, and room semantics.
-- OpenAI Realtime handles fast conversational reasoning.
-- Cartesia gives a dedicated, controllable voice layer.
-- API + worker split keeps control plane separate from media/runtime plane.
-
----
-
-## Monorepo structure
-
-```txt
+```text
 voice-agent-platform/
   apps/
-    frontend/   # Next.js + LiveKit React starter-style voice UI
-    server/     # Express API: health + session/token endpoint
-    worker/     # LiveKit Agents JS runtime + model/tts/tools
+    frontend/   # Next.js voice UI (LiveKit starter-style + Agents UI)
+    server/     # Express API for health + session start + token minting
+    worker/     # LiveKit Agents JS worker (OpenAI Realtime + Cartesia + tools)
   packages/
-    shared/     # shared zod contracts + logging utilities
-    config/     # env loading + validation helpers
+    shared/     # Shared contracts/types/utilities
+    config/     # Shared config helpers
 ```
 
----
+## Feature Set
 
-## End-to-end request flow
+### Voice + Session UX (Frontend)
+- Connect/disconnect controls
+- Microphone controls
+- Agent audio playback via room audio renderer
+- Live transcript UI
+- Explicit state panel: `connecting`, `listening`, `thinking`, `speaking`, `error`
+- Audio visualizer components
+- Session start flow backed by API token service (not sandbox-only)
 
-1. User opens frontend (`apps/frontend`) and clicks connect/start.
-2. Frontend calls `POST /session/start` on API server.
-3. API validates request, creates session row in Postgres, stores ephemeral state in Redis.
-4. API mints LiveKit participant JWT and includes room dispatch metadata (`agentName`).
-5. Frontend receives `{ token, livekitUrl, roomName, sessionId, expiresAt }`.
-6. Frontend joins LiveKit room over WebRTC.
-7. LiveKit dispatches worker job to the registered worker process.
-8. Worker joins room as agent participant.
-9. Worker starts `AgentSession`:
-   - LLM: `openai.realtime.RealtimeModel({ modalities: ['text'] })`
-   - TTS: `inference.TTS({ model: 'cartesia/sonic-3', ... })`
-10. User speech is processed in real time; agent generates text and Cartesia synthesizes final audio.
-11. Agent audio is published back to room and played in browser.
-12. Transcript/tool/outcome events are persisted in Postgres; short-lived context lands in Redis.
+### API Control Plane (Server)
+- `GET /health`
+- `POST /session/start`
+- LiveKit participant token minting via server SDK
+- Agent dispatch metadata embedded in token room configuration
+- Structured logging + request IDs
+- Session persistence bootstrap
 
----
+### Agent Runtime (Worker)
+- LiveKit worker entry via `defineAgent(...)` + `cli.runApp(...)`
+- Agent joins dispatched rooms as agent participant
+- OpenAI Realtime model integration in text-only mode
+- Cartesia Sonic-3 synthesis as separate TTS
+- Turn-taking and interruption tuning
+- Tool calling with Zod-validated inputs
+- Persistence hooks for transcripts, tool events, and outcomes
 
-## What each app does
+### Data + State
+- PostgreSQL tables:
+  - `sessions`
+  - `transcript_events`
+  - `tool_events`
+  - `outcomes`
+- Redis for ephemeral workflow/session context
 
-## 1) Frontend (`apps/frontend`)
+### Observability
+- Structured logs across frontend/server/worker
+- Worker event logs for user/agent state transitions
+- Tool invocation/result logging
+- TODO hooks for latency and TTS timing metrics
 
-Current frontend follows the **React starter app model** (Next.js + Agents UI components):
+## Stack Used (Service by Service)
 
-- Session lifecycle via `useSession(...)`
-- Token retrieval via `TokenSource.custom(...)`
-- Agent UX components (visualizer, control bar, transcript, start-audio UX)
+### Frontend (`apps/frontend`)
+- Next.js (React + TypeScript)
+- `livekit-client`
+- `@livekit/components-react`
+- Agents UI starter components (control bar, transcript, visualizers)
 
-Important file:
-
+Key files:
 - `apps/frontend/components/app/app.tsx`
+- `apps/frontend/components/app/view-controller.tsx`
+- `apps/frontend/components/agents-ui/agent-session-provider.tsx`
+- `apps/frontend/components/agents-ui/agent-state-panel.tsx`
 
-What happens there:
+### Server (`apps/server`)
+- Express + TypeScript
+- `livekit-server-sdk`
+- `@livekit/protocol` for room dispatch config
+- `pg` + `ioredis`
+- `zod` for payload/config validation
 
-- Creates a token source that calls your backend `/session/start`
-- Converts server response into LiveKit token-source format:
-  - `serverUrl`
-  - `participantToken`
-- Starts a LiveKit session with optional `agentName` dispatch
-
-## 2) API server (`apps/server`)
-
-- `GET /health` for service liveness
-- `POST /session/start` for room + token bootstrap
-
-Important file:
-
+Key files:
 - `apps/server/src/controllers/session.controller.ts`
+- `apps/server/src/services/livekit.service.ts`
+- `apps/server/src/routes/session.routes.ts`
 
-The endpoint:
-
-- validates payload with Zod
-- persists session record
-- mints LiveKit token via `livekit-server-sdk`
-- returns room/token/URL metadata to frontend
-
-## 3) Worker (`apps/worker`)
-
-Important file:
-
-- `apps/worker/src/agent/entry.ts`
-
-Worker responsibilities:
-
-- Join dispatched room (`defineAgent` + job context)
-- Resolve persisted session UUID by room name for DB-safe writes
-- Start `voice.AgentSession` with OpenAI Realtime text-only + Cartesia TTS
-- Register and execute tools (e.g. availability checker)
-- Write transcript/tool/outcome events to Postgres
-
----
-
-## SDK usage map
-
-## LiveKit client SDK + React components
-
-Used in frontend:
-
-- `livekit-client` (TokenSource and core room session primitives)
-- `@livekit/components-react` (Session hook, UI controls, voice/session state)
-
-## LiveKit server SDK
-
-Used in API server:
-
-- `livekit-server-sdk` for JWT minting and grants
-
-## LiveKit Agents JS SDK
-
-Used in worker:
-
+### Worker (`apps/worker`)
 - `@livekit/agents`
-- `defineAgent(...)`
-- `voice.AgentSession`
-- worker process startup via `cli.runApp(...)`
-
-## OpenAI Realtime plugin
-
-Used in worker:
-
 - `@livekit/agents-plugin-openai`
 - `openai.realtime.RealtimeModel(...)`
+- `inference.TTS({ model: 'cartesia/sonic-3', ... })`
+- Zod-validated tool interfaces
+- `pg` + `ioredis`
 
-Configured with:
+Key files:
+- `apps/worker/src/index.ts`
+- `apps/worker/src/agent/entry.ts`
+- `apps/worker/src/tools/check-availability.tool.ts`
 
-- `modalities: ['text']`
+## End-to-End Request Flow
 
-## Cartesia Sonic-3 TTS
+1. User opens frontend and clicks start/connect.
+2. Frontend calls `POST /session/start` on the server.
+3. Server validates payload and creates/updates session records.
+4. Server mints LiveKit access token and embeds room dispatch metadata (`agentName`).
+5. Frontend receives `{ token, livekitUrl, roomName, sessionId, ... }`.
+6. Frontend joins LiveKit room over WebRTC.
+7. LiveKit dispatches a job to the registered worker.
+8. Worker joins the room as the agent participant.
+9. Worker starts `AgentSession` with:
+   - OpenAI Realtime (text-only)
+   - Cartesia Sonic-3 TTS
+10. User speaks, agent reasons in realtime, agent audio is synthesized by Cartesia.
+11. Agent audio is published to the room and played in the browser.
+12. Session/transcript/tool/outcome events are written to Postgres; runtime context to Redis.
 
-Used in worker via LiveKit inference:
+## General Voice Agent Behavior
 
-- `inference.TTS({ model: 'cartesia/sonic-3', voice, language })`
+The current assistant instructions are configured as a **general-purpose voice assistant**:
+- broad question answering and task help
+- concise and practical responses
+- interruption-aware behavior
+- tool usage only when it adds value
 
----
+Appointment tooling remains available as an optional capability.
 
-## Data model and persistence
+## Local Setup
 
-Schema file:
-
-- `apps/server/src/db/schema.sql`
-
-Tables:
-
-- `sessions`
-- `transcript_events`
-- `tool_events`
-- `outcomes`
-
-Design intent:
-
-- `sessions`: canonical lifecycle + room identity
-- `transcript_events`: append-only conversational trace
-- `tool_events`: observability for external side effects
-- `outcomes`: structured final/derived states per session
-
-Redis usage:
-
-- ephemeral auth/session/workflow context
-- caches short-lived runtime state
-
----
-
-## Local setup
-
-Prerequisites:
-
+### Prerequisites
 - Node.js 20+
 - PostgreSQL 14+
 - Redis 7+
 - LiveKit Cloud project
-- OpenAI API key (Realtime-enabled)
+- OpenAI API key
 
-## 1) Environment files
+### 1) Configure env files
 
 ```bash
 cp apps/server/.env.example apps/server/.env
@@ -238,57 +180,50 @@ cp apps/worker/.env.example apps/worker/.env
 cp apps/frontend/.env.example apps/frontend/.env
 ```
 
-Fill required values:
-
+Minimum required variables:
 - `LIVEKIT_URL`
 - `LIVEKIT_API_KEY`
 - `LIVEKIT_API_SECRET`
+- `LIVEKIT_AGENT_NAME` (server and worker must match)
 - `OPENAI_API_KEY`
+- `OPENAI_REALTIME_MODEL` (example: `gpt-realtime`)
 - `DATABASE_URL`
 - `REDIS_URL`
-- `NEXT_PUBLIC_API_BASE_URL` (frontend)
+- `NEXT_PUBLIC_API_BASE_URL`
 
-## 2) Install dependencies
+### 2) Install dependencies
 
 ```bash
 npm install
 ```
 
-## 3) Start Postgres + Redis
-
-Example with Homebrew:
+### 3) Start Postgres + Redis (example with Homebrew)
 
 ```bash
 brew services start postgresql@14
 brew services start redis
 ```
 
-## 4) Apply DB schema
+### 4) Apply DB schema
 
 ```bash
-psql "$DATABASE_URL" -f apps/server/src/db/schema.sql
+psql "postgres://postgres:postgres@localhost:5432/voice_agent" -f apps/server/src/db/schema.sql
 ```
 
----
-
-## Run and verify
-
-Start all apps:
+### 5) Run all services
 
 ```bash
 npm run dev
 ```
 
-Expected:
+Expected local endpoints:
+- Frontend: `http://localhost:3000`
+- API: `http://localhost:4000`
 
-- Frontend (Next.js): `http://localhost:3000`
-- API server listening on `:4000`
-- Worker logs `registered worker`
+## Quick Live Check
 
-Quick live checks:
-
-1. Start stack and confirm boot logs.
-2. Create session via API:
+1. Boot stack and confirm worker shows `registered worker`.
+2. Trigger API session bootstrap:
 
 ```bash
 curl -s -X POST http://localhost:4000/session/start \
@@ -296,108 +231,88 @@ curl -s -X POST http://localhost:4000/session/start \
   -d '{"userId":"livecheck-user","channel":"web","context":{"timezone":"Africa/Nairobi","locale":"en-US"}}'
 ```
 
-3. Open `http://localhost:3000`, connect, speak, and confirm:
+3. Open frontend, start conversation, and verify logs:
+- API: session started
+- Worker: job received + joined room
+- Frontend: state transitions + transcript updates
 
-- worker receives job request
-- worker joins room
-- UI transitions through agent states
-- transcript/tool logs appear
+## Turn-Taking and Interruption Tuning
 
----
+Worker supports configurable turn settings via env:
+- `TURN_DETECTION_MODE`
+- `TURN_ENDPOINTING_MIN_DELAY_MS`
+- `TURN_ENDPOINTING_MAX_DELAY_MS`
+- `INTERRUPTION_ENABLED`
+- `INTERRUPTION_MODE`
+- `INTERRUPTION_MIN_DURATION_MS`
+- `INTERRUPTION_MIN_WORDS`
+- `INTERRUPTION_FALSE_TIMEOUT_MS`
+- `INTERRUPTION_RESUME_FALSE`
+- `INTERRUPTION_DISCARD_AUDIO_IF_UNINTERRUPTIBLE`
+- `PROACTIVE_UX_ENABLED`
+- `PROACTIVE_IDLE_NUDGE_MS`
+- `PROACTIVE_CLARIFICATION_REPROMPT_MS`
+- `PROACTIVE_MAX_IDLE_NUDGES`
 
-## Troubleshooting
+Use these to reduce false interruptions and improve barge-in quality.
 
-## Error: `invalid input syntax for type uuid`
+## Deployment Notes
 
-Cause:
+Services are deployable independently:
+- Frontend app
+- API server
+- Worker service
 
-- writing `roomName` into UUID `session_id` columns.
-
-Fix in this repo:
-
-- worker resolves real session UUID by `room_name` before DB writes.
-
-## Frontend connects but no agent response
-
-Check:
-
-- worker registered and receiving jobs
-- `AGENT_NAME` / dispatch name consistency
-- OpenAI key configured in worker env
-
-## App "works" without OpenAI key
-
-Usually means:
-
-- key still present in env file
-- process not restarted after key change
-
-Confirm by clearing key, restarting worker, and verifying boot-time env validation fails.
-
-## Token endpoint errors from frontend
-
-Check:
-
-- `NEXT_PUBLIC_API_BASE_URL` points to running API
-- server returns valid JSON with `token` and `livekitUrl`
-
----
-
-## Deployment notes
-
-Server and worker have Dockerfiles:
-
+Included Dockerfiles:
 - `apps/server/Dockerfile`
 - `apps/worker/Dockerfile`
 
-Deploy services independently:
-
-- frontend (Next.js hosting)
-- API service
-- worker service
+Recommended production setup:
 - managed Postgres + Redis
+- secret manager for all keys
+- auth + rate limiting on `/session/start`
+- centralized logs and traces
 
-Recommended production topology:
+## Troubleshooting
 
-- private worker network access to DB/Redis
-- API behind auth/rate limit layer
-- secret manager for all credentials
+### "Agent did not join the room"
+Check in order:
+1. Worker process is running and registered.
+2. `LIVEKIT_AGENT_NAME` matches in:
+   - `apps/server/.env`
+   - `apps/worker/.env`
+3. Worker logs show `received job request` and then `worker joined room`.
+4. Worker did not crash in entry (look for `error in entry function`).
+
+### TTS websocket parsing errors
+This project includes a worker postinstall compatibility patch to tolerate unknown non-critical TTS event types until upstream protocol alignment.
+
+### Postgres connection refused
+Database is not running or wrong `DATABASE_URL`.
+
+### Redis connection errors
+Redis is not running or wrong `REDIS_URL`.
+
+## Credentials and External Setup Still Required
+
+To run locally, you still need real external setup for:
+- LiveKit Cloud project + API key/secret
+- OpenAI API key with Realtime access
+- Running PostgreSQL instance
+- Running Redis instance
+
+## Technical Article Angle (Suggested)
+
+If you are writing an article, this repo supports a strong narrative:
+1. Why half-cascade voice architecture
+2. Real-time media transport with LiveKit
+3. Control plane vs runtime plane separation
+4. OpenAI Realtime in text-only mode
+5. Cartesia as dedicated voice layer
+6. Tooling + persistence for production observability
+7. Turn-taking and interruption tuning in practice
+8. Deployment and hardening checklist
 
 ---
 
-## Security and production hardening
-
-Important:
-
-- Rotate any API keys that were shared in plaintext.
-- Add real auth in `/session/start` (JWT/session introspection).
-- Add authorization scopes for tool access.
-- Add per-user/session rate limits.
-- Add OpenTelemetry tracing + request correlation IDs.
-- Add retry/backoff + dead-letter strategy for critical writes.
-- Add data retention policies for transcript/tool events.
-
----
-
-## Article outline you can reuse
-
-Title:
-
-- **How to build a production-ready voice agent platform with LiveKit, OpenAI Realtime, Cartesia, and Node.js**
-
-Suggested sections:
-
-1. Why half-cascade beats naive full pipelines for real-time voice UX
-2. System architecture: transport, intelligence, synthesis, storage
-3. Building the control plane (`/session/start`) with LiveKit token dispatch
-4. Implementing the media/runtime plane with LiveKit Agents JS
-5. Integrating OpenAI Realtime in text-only mode
-6. Integrating Cartesia Sonic-3 as dedicated TTS
-7. Tool calling, validation, and persistence strategy
-8. Observability and state transitions that matter in production
-9. Failure modes and how this architecture mitigates them
-10. Deployment topology and hardening checklist
-
----
-
-If you want, I can also generate a matching `docs/article-draft.md` with screenshots/log snippets placeholders so you can publish faster.
+If you want, I can also generate a publish-ready `docs/article-draft.md` with section prose, code snippets, and diagram callouts derived from this README.

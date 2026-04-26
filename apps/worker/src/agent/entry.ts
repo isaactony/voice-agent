@@ -7,18 +7,28 @@ import { findSessionIdByRoomName, writeOutcome, writeTranscriptEvent } from '../
 import { storeEphemeralContext } from '../state/session-context';
 
 const ASSISTANT_INSTRUCTIONS = `
-You are a production-grade customer support and appointment booking voice agent.
+You are a production-grade general voice assistant.
 
 Behavior rules:
-- Be concise, warm, and operationally precise.
-- Confirm critical details before making commitments.
-- If the user interrupts, stop speaking and prioritize the latest user request.
-- Use tools when availability or booking data is required.
-- Never invent booking slots if a tool is available.
+- Help with a broad range of user questions and tasks.
+- Be concise, warm, accurate, and practical.
+- If you are uncertain, say so briefly and ask a clarifying question.
+- If the user interrupts, stop speaking and prioritize the latest request.
+- Use available tools only when they add real value to the current task.
+- For appointment requests, use the availability tool instead of inventing slots.
+- Do not claim actions were completed unless a tool/system confirms success.
 `;
 
 export default defineAgent({
   entry: async (ctx: JobContext) => {
+    const safeSideEffect = async (op: string, fn: () => Promise<void>) => {
+      try {
+        await fn();
+      } catch (error) {
+        logger.warn({ err: error, op }, 'non-blocking side effect failed');
+      }
+    };
+
     await ctx.connect();
 
     const participant = await ctx.waitForParticipant();
@@ -39,18 +49,22 @@ export default defineAgent({
       logger.warn({ roomName }, 'no persisted session found for room; DB event writes will be skipped');
     }
 
-    await storeEphemeralContext(runtimeSessionKey, {
-      roomName,
-      participantIdentity: participant.identity,
-      status: 'connected'
+    await safeSideEffect('storeEphemeralContext.connected', async () => {
+      await storeEphemeralContext(runtimeSessionKey, {
+        roomName,
+        participantIdentity: participant.identity,
+        status: 'connected'
+      });
     });
 
     if (persistedSessionId) {
-      await writeTranscriptEvent({
-        sessionId: persistedSessionId,
-        source: 'system',
-        content: 'Agent connected to room',
-        metadata: { participantIdentity: participant.identity }
+      await safeSideEffect('writeTranscriptEvent.agent_connected', async () => {
+        await writeTranscriptEvent({
+          sessionId: persistedSessionId,
+          source: 'system',
+          content: 'Agent connected to room',
+          metadata: { participantIdentity: participant.identity }
+        });
       });
     }
 
@@ -95,6 +109,106 @@ export default defineAgent({
       turnHandling
     });
 
+    let agentState: 'initializing' | 'idle' | 'listening' | 'thinking' | 'speaking' = 'initializing';
+    let userState: 'speaking' | 'listening' | 'away' = 'listening';
+    let idleNudgeTimer: NodeJS.Timeout | null = null;
+    let clarificationTimer: NodeJS.Timeout | null = null;
+    let idleNudgesSent = 0;
+    let hasUserSpoken = false;
+
+    const clearIdleNudgeTimer = () => {
+      if (idleNudgeTimer) {
+        clearTimeout(idleNudgeTimer);
+        idleNudgeTimer = null;
+      }
+    };
+
+    const clearClarificationTimer = () => {
+      if (clarificationTimer) {
+        clearTimeout(clarificationTimer);
+        clarificationTimer = null;
+      }
+    };
+
+    const canProactivelySpeak = () =>
+      env.PROACTIVE_UX_ENABLED &&
+      hasUserSpoken &&
+      agentState === 'listening' &&
+      userState !== 'speaking';
+
+    const safeSessionSay = async (text: string, reason: 'idle_nudge' | 'clarification_reprompt') => {
+      try {
+        if (!canProactivelySpeak()) return;
+        session.say(text, { allowInterruptions: true, addToChatCtx: false });
+        logger.info({ roomName, sessionId: persistedSessionId, reason, text }, 'proactive ux prompt sent');
+        if (persistedSessionId) {
+          await safeSideEffect(`writeTranscriptEvent.${reason}`, async () => {
+            await writeTranscriptEvent({
+              sessionId: persistedSessionId,
+              source: 'system',
+              content: text,
+              metadata: { reason, proactive: true }
+            });
+          });
+        }
+      } catch (error) {
+        logger.warn({ err: error, reason }, 'failed to emit proactive ux prompt');
+      }
+    };
+
+    const scheduleIdleNudge = () => {
+      clearIdleNudgeTimer();
+      if (!canProactivelySpeak()) return;
+      if (idleNudgesSent >= env.PROACTIVE_MAX_IDLE_NUDGES) return;
+
+      idleNudgeTimer = setTimeout(async () => {
+        if (!canProactivelySpeak()) return;
+        idleNudgesSent += 1;
+        await safeSessionSay(
+          idleNudgesSent === 1
+            ? 'Are you still there? I can continue whenever you are ready.'
+            : 'No rush. If you want to continue, tell me your next question.',
+          'idle_nudge'
+        );
+
+        if (idleNudgesSent < env.PROACTIVE_MAX_IDLE_NUDGES) {
+          scheduleIdleNudge();
+        }
+      }, env.PROACTIVE_IDLE_NUDGE_MS);
+    };
+
+    const scheduleClarificationReprompt = () => {
+      clearClarificationTimer();
+      if (!canProactivelySpeak()) return;
+
+      clarificationTimer = setTimeout(async () => {
+        if (!canProactivelySpeak()) return;
+        await safeSessionSay(
+          'I might have missed that. Could you rephrase or add a bit more detail?',
+          'clarification_reprompt'
+        );
+      }, env.PROACTIVE_CLARIFICATION_REPROMPT_MS);
+    };
+
+    const normalize = (text: string) => text.trim().toLowerCase().replace(/[.!?]+$/g, '');
+    const isAmbiguousTranscript = (text: string) => {
+      const cleaned = normalize(text);
+      if (!cleaned) return true;
+      if (cleaned.length <= 2) return true;
+      const lowSignalPhrases = new Set([
+        'huh',
+        'hm',
+        'hmm',
+        'uh',
+        'um',
+        'what',
+        'hello',
+        'can you repeat',
+        'say again'
+      ]);
+      return lowSignalPhrases.has(cleaned);
+    };
+
     session.on(voice.AgentSessionEventTypes.OverlappingSpeech, (ev) => {
       logger.info(
         {
@@ -110,11 +224,57 @@ export default defineAgent({
     });
 
     session.on(voice.AgentSessionEventTypes.UserStateChanged, (ev) => {
+      userState = ev.newState;
       logger.info({ roomName, sessionId: persistedSessionId, oldState: ev.oldState, newState: ev.newState }, 'user state changed');
+
+      if (!env.PROACTIVE_UX_ENABLED) return;
+
+      if (ev.newState === 'speaking') {
+        clearIdleNudgeTimer();
+        clearClarificationTimer();
+        return;
+      }
+
+      if (ev.newState === 'listening') {
+        scheduleIdleNudge();
+        return;
+      }
+
+      if (ev.newState === 'away') {
+        scheduleIdleNudge();
+      }
     });
 
     session.on(voice.AgentSessionEventTypes.AgentStateChanged, (ev) => {
+      agentState = ev.newState;
       logger.info({ roomName, sessionId: persistedSessionId, oldState: ev.oldState, newState: ev.newState }, 'agent state changed');
+
+      if (!env.PROACTIVE_UX_ENABLED) return;
+
+      if (ev.newState === 'speaking' || ev.newState === 'thinking') {
+        clearIdleNudgeTimer();
+        clearClarificationTimer();
+        return;
+      }
+
+      if (ev.newState === 'listening') {
+        scheduleIdleNudge();
+      }
+    });
+
+    session.on(voice.AgentSessionEventTypes.UserInputTranscribed, (ev) => {
+      if (!ev.isFinal) return;
+      hasUserSpoken = true;
+      idleNudgesSent = 0;
+      clearIdleNudgeTimer();
+      clearClarificationTimer();
+
+      if (!env.PROACTIVE_UX_ENABLED) return;
+      if (isAmbiguousTranscript(ev.transcript)) {
+        scheduleClarificationReprompt();
+      } else {
+        scheduleIdleNudge();
+      }
     });
 
     const agent = new voice.Agent({
@@ -134,25 +294,32 @@ export default defineAgent({
     });
 
     if (persistedSessionId) {
-      await writeOutcome({
-        sessionId: persistedSessionId,
-        outcomeType: 'session_started',
-        summary: 'Agent session started successfully',
-        metadata: {
-          llm: env.OPENAI_REALTIME_MODEL,
-          ttsModel: 'cartesia/sonic-3'
-        }
+      await safeSideEffect('writeOutcome.session_started', async () => {
+        await writeOutcome({
+          sessionId: persistedSessionId,
+          outcomeType: 'session_started',
+          summary: 'Agent session started successfully',
+          metadata: {
+            llm: env.OPENAI_REALTIME_MODEL,
+            ttsModel: 'cartesia/sonic-3'
+          }
+        });
       });
     }
 
     // TODO: Add production metrics: latency per turn, realtime token usage, and TTS synthesis duration.
 
     ctx.room.on('disconnected', async () => {
+      clearIdleNudgeTimer();
+      clearClarificationTimer();
+
       if (persistedSessionId) {
-        await writeOutcome({
-          sessionId: persistedSessionId,
-          outcomeType: 'session_ended',
-          summary: 'Room disconnected'
+        await safeSideEffect('writeOutcome.session_ended', async () => {
+          await writeOutcome({
+            sessionId: persistedSessionId,
+            outcomeType: 'session_ended',
+            summary: 'Room disconnected'
+          });
         });
       }
 
