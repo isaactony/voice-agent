@@ -3,8 +3,8 @@ import * as openai from '@livekit/agents-plugin-openai';
 import { env } from '../config/env';
 import { logger } from '../observability/logger';
 import { checkAvailabilityTool } from '../tools/check-availability.tool';
-import { findSessionIdByRoomName, writeOutcome, writeTranscriptEvent } from '../db/events';
-import { storeEphemeralContext } from '../state/session-context';
+import { findSessionIdByRoomName, updateSessionStatus, writeOutcome, writeTranscriptEvent } from '../db/events';
+import { deleteEphemeralContext, mergeEphemeralContext, storeEphemeralContext } from '../state/session-context';
 
 const ASSISTANT_INSTRUCTIONS = `
 You are a production-grade general voice assistant.
@@ -56,6 +56,12 @@ export default defineAgent({
         status: 'connected'
       });
     });
+
+    if (persistedSessionId) {
+      await safeSideEffect('updateSessionStatus.active', async () => {
+        await updateSessionStatus(persistedSessionId, 'active');
+      });
+    }
 
     if (persistedSessionId) {
       await safeSideEffect('writeTranscriptEvent.agent_connected', async () => {
@@ -111,6 +117,7 @@ export default defineAgent({
 
     let agentState: 'initializing' | 'idle' | 'listening' | 'thinking' | 'speaking' = 'initializing';
     let userState: 'speaking' | 'listening' | 'away' = 'listening';
+    let proactiveSessionActive = false;
     let idleNudgeTimer: NodeJS.Timeout | null = null;
     let clarificationTimer: NodeJS.Timeout | null = null;
     let idleNudgesSent = 0;
@@ -132,6 +139,7 @@ export default defineAgent({
 
     const canProactivelySpeak = () =>
       env.PROACTIVE_UX_ENABLED &&
+      proactiveSessionActive &&
       hasUserSpoken &&
       agentState === 'listening' &&
       userState !== 'speaking';
@@ -277,6 +285,30 @@ export default defineAgent({
       }
     });
 
+    session.on(voice.AgentSessionEventTypes.Close, (ev) => {
+      proactiveSessionActive = false;
+      clearIdleNudgeTimer();
+      clearClarificationTimer();
+      void safeSideEffect('mergeEphemeralContext.closed', async () => {
+        await mergeEphemeralContext(runtimeSessionKey, {
+          status: 'agent_session_closed',
+          closeReason: ev.reason,
+          closedAt: new Date().toISOString()
+        });
+      });
+
+      if (persistedSessionId) {
+        void safeSideEffect('updateSessionStatus.ended.close', async () => {
+          await updateSessionStatus(persistedSessionId, 'ended');
+        });
+      }
+
+      logger.info(
+        { roomName, sessionId: persistedSessionId, reason: ev.reason, error: ev.error },
+        'agent session closed'
+      );
+    });
+
     const agent = new voice.Agent({
       instructions: ASSISTANT_INSTRUCTIONS,
       tools: {
@@ -292,6 +324,7 @@ export default defineAgent({
         textEnabled: true
       }
     });
+    proactiveSessionActive = true;
 
     if (persistedSessionId) {
       await safeSideEffect('writeOutcome.session_started', async () => {
@@ -310,10 +343,26 @@ export default defineAgent({
     // TODO: Add production metrics: latency per turn, realtime token usage, and TTS synthesis duration.
 
     ctx.room.on('disconnected', async () => {
+      proactiveSessionActive = false;
       clearIdleNudgeTimer();
       clearClarificationTimer();
 
+      await safeSideEffect('mergeEphemeralContext.disconnected', async () => {
+        await mergeEphemeralContext(runtimeSessionKey, {
+          status: 'disconnected',
+          disconnectedAt: new Date().toISOString()
+        });
+      });
+
+      await safeSideEffect('deleteEphemeralContext.disconnected', async () => {
+        await deleteEphemeralContext(runtimeSessionKey);
+      });
+
       if (persistedSessionId) {
+        await safeSideEffect('updateSessionStatus.ended.room_disconnected', async () => {
+          await updateSessionStatus(persistedSessionId, 'ended');
+        });
+
         await safeSideEffect('writeOutcome.session_ended', async () => {
           await writeOutcome({
             sessionId: persistedSessionId,

@@ -59,3 +59,21 @@ export const writeOutcome = async (params: {
     [randomUUID(), params.sessionId, params.outcomeType, params.summary, JSON.stringify(params.metadata ?? {})]
   );
 };
+
+export const updateSessionStatus = async (
+  sessionId: string,
+  status: 'active' | 'ended',
+  endedAt?: string
+) => {
+  await pool.query(
+    `UPDATE sessions
+     SET status = $2,
+         updated_at = NOW(),
+         ended_at = CASE
+           WHEN $2 = 'ended' THEN COALESCE($3::timestamptz, NOW())
+           ELSE ended_at
+         END
+     WHERE id = $1`,
+    [sessionId, status, endedAt ?? null]
+  );
+};

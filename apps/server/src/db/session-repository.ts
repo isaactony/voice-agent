@@ -33,6 +33,26 @@ export const createSession = async (input: Omit<SessionRecord, 'id'>): Promise<S
   return { id, ...input };
 };
 
+export const updateSessionStatus = async (
+  sessionId: string,
+  status: SessionRecord['status'],
+  endedAt?: string
+) => {
+  await withClient(async (client) => {
+    await client.query(
+      `UPDATE sessions
+       SET status = $2,
+           updated_at = NOW(),
+           ended_at = CASE
+             WHEN $2 = 'ended' THEN COALESCE($3::timestamptz, NOW())
+             ELSE ended_at
+           END
+       WHERE id = $1`,
+      [sessionId, status, endedAt ?? null]
+    );
+  });
+};
+
 export const appendTranscriptEvent = async (params: {
   sessionId: string;
   source: string;

@@ -6,17 +6,20 @@ import {
 } from '@voice-agent/shared';
 import { env } from '../config/env';
 import { logger } from '../lib/logger';
-import { validateSessionRequest } from '../services/auth.service';
+import { requireCallerIdentity, validateSessionRequest } from '../services/auth.service';
 import { mintParticipantToken } from '../services/livekit.service';
 import { createSession } from '../db/session-repository';
 import { writeSessionState } from '../services/session-state.service';
+import { enforceSessionStartGuardrails } from '../services/rate-limit.service';
 
 const buildRoomName = (userId: string) => `voice-${userId}-${Date.now()}`;
 
 export const startSessionHandler = async (req: Request, res: Response) => {
   const payload = startSessionRequestSchema.parse(req.body) as StartSessionRequest;
+  const identity = await requireCallerIdentity(req);
+  await enforceSessionStartGuardrails(req, identity);
 
-  await validateSessionRequest(payload.userId);
+  await validateSessionRequest(identity, payload.userId);
 
   const participantIdentity = `user-${payload.userId}`;
   const roomName = buildRoomName(payload.userId);
@@ -30,6 +33,7 @@ export const startSessionHandler = async (req: Request, res: Response) => {
   const token = await mintParticipantToken({ roomName, participantIdentity });
 
   await writeSessionState(session.id, {
+    status: 'created',
     roomName,
     participantIdentity,
     requestId: req.requestId,
@@ -42,7 +46,9 @@ export const startSessionHandler = async (req: Request, res: Response) => {
       requestId: req.requestId,
       sessionId: session.id,
       roomName,
-      userId: payload.userId
+      userId: payload.userId,
+      actorId: identity.actorId,
+      tokenId: identity.tokenId
     },
     'session started'
   );

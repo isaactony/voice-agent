@@ -14,6 +14,7 @@ import { useDebugMode } from '@/hooks/useDebug';
 
 const IN_DEVELOPMENT = process.env.NODE_ENV !== 'production';
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:4000';
+const SESSION_BEARER_TOKEN = process.env.NEXT_PUBLIC_SESSION_BEARER_TOKEN;
 
 function AppSetup() {
   useDebugMode({ enabled: IN_DEVELOPMENT });
@@ -33,7 +34,10 @@ export function App({ appConfig }: AppProps) {
     return TokenSource.custom(async () => {
       const response = await fetch(`${API_BASE_URL}/session/start`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          ...(SESSION_BEARER_TOKEN ? { authorization: `Bearer ${SESSION_BEARER_TOKEN}` } : {})
+        },
         body: JSON.stringify({
           userId: userIdRef.current,
           channel: 'web',
